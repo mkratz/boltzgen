@@ -1821,7 +1821,7 @@ class YamlDesignParser:
 
                 # Set exclude_mask values to 0
                 if "res_index" not in chain:
-                    include_mask[c_start:c_end] = 0
+                    exclude_mask[c_start:c_end] = 0
                 else:
                     indices = parse_range(chain["res_index"], c_start, c_end)
                     exclude_mask[indices] = 0
@@ -2042,13 +2042,16 @@ class YamlDesignParser:
                         indices = parse_range(sheet, c_start, c_end)
                         fss_type[indices] = const.ss_type_ids["SHEET"]
 
-        # Parse and apply design insertions
-        # First pass: collect insertions and coordinate lengths for symmetric chains
+        # Parse and apply design insertions.
+        # Insertions are sorted by absolute position descending (right-to-left)
+        # so that each insertion does not shift the positions of subsequent ones.
+        # This makes the result independent of the order specified in the YAML.
         if design_insertions is not None:
-            num_inserted = defaultdict(int)
             # Group insertions by (symmetric_group, res_index) to coordinate variable lengths
-            symmetric_length_cache = {}  # (sym_group, res_index) -> sampled_length
+            symmetric_length_cache = {}  # (sym_group, orig_res_index, spec) -> sampled_length
 
+            # Validate and compute absolute positions for sorting
+            parsed_insertions = []
             for list_element in design_insertions:
                 insertion = list_element["insertion"]
                 if "id" not in insertion:
@@ -2058,8 +2061,21 @@ class YamlDesignParser:
                     msg = f"Misspecified insertion in design_insertions with missing 'res_index' for file with path {path}."
                     raise ValueError(msg)
                 chain_id = insertion["id"]
-                res_index = insertion["res_index"] - 1  # 1 index input to 0 indexed
-                res_index += num_inserted[chain_id]
+                if chain_id not in structure.chains["name"]:
+                    msg = f"Specified chain id {chain_id} not in file {path}."
+                    raise ValueError(msg)
+                target_chain = structure.chains[structure.chains["name"] == chain_id]
+                res_index = insertion["res_index"] - 1  # 1-indexed input to 0-indexed
+                abs_pos = target_chain["res_idx"].item() + res_index
+                parsed_insertions.append((abs_pos, insertion))
+
+            # Sort by absolute position descending so right-to-left processing
+            # avoids index shifting between insertions
+            parsed_insertions.sort(key=lambda x: x[0], reverse=True)
+
+            for _, insertion in parsed_insertions:
+                chain_id = insertion["id"]
+                res_index = insertion["res_index"] - 1  # 1-indexed input to 0-indexed
                 ss_insert_type = insertion.get("secondary_structure", "UNSPECIFIED")
 
                 num_residues_spec = insertion["num_residues"]
@@ -2070,7 +2086,7 @@ class YamlDesignParser:
 
                 # If chain has symmetric_group > 0, coordinate length with other symmetric chains
                 if chain_sym_group > 0:
-                    cache_key = (chain_sym_group, res_index, str(num_residues_spec))
+                    cache_key = (chain_sym_group, insertion["res_index"], str(num_residues_spec))
                     if cache_key in symmetric_length_cache:
                         num_residues = symmetric_length_cache[cache_key]
                     else:
@@ -2079,13 +2095,8 @@ class YamlDesignParser:
                 else:
                     num_residues = np.random.choice(num_residues_range).item()
 
-                # We add +1 because the parse_range function is usually used for indexing where we then convert the 1 based inputs to 0 indexing
+                # parse_range converts 1-indexed to 0-indexed, so add 1 back for a count
                 num_residues += 1
-                num_inserted[chain_id] += num_residues
-
-                if chain_id not in structure.chains["name"]:
-                    msg = f"Specified chain id {chain_id} not in file {path}."
-                    raise ValueError(msg)
 
                 target_chain = structure.chains[structure.chains["name"] == chain_id]
                 res_insert_idx = target_chain["res_idx"] + res_index
