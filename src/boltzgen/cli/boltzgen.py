@@ -71,6 +71,7 @@ step_names = [
     "inverse_folding",
     "design_folding",
     "folding",
+    "boltz2_refolding",
     "affinity",
     "analysis",
     "filtering",
@@ -294,6 +295,34 @@ def add_configure_arguments(
         type=str,
         help="Path to the affinity predictor checkpoint. Default: %(default)s",
         default=ARTIFACTS["affinity"][0],
+    )
+    p.add_argument(
+        "--use_boltz2_refolding",
+        action="store_true",
+        help="Replace BoltzGen's internal refolding step with Boltz-2's CLI "
+        "(boltz predict) which supports hard template enforcement. This keeps "
+        "the target structure stable during refolding and is recommended for "
+        "multi-chain targets.",
+    )
+    p.add_argument(
+        "--template_threshold",
+        type=float,
+        default=2.0,
+        help="Angstrom deviation threshold for Boltz-2 template enforcement "
+        "(only used with --use_boltz2_refolding). Default: %(default)s",
+    )
+    p.add_argument(
+        "--boltz2_diffusion_samples",
+        type=int,
+        default=5,
+        help="Number of diffusion samples per design when using Boltz-2 refolding. "
+        "Default: %(default)s",
+    )
+    p.add_argument(
+        "--boltz2_sampling_steps",
+        type=int,
+        default=200,
+        help="Number of sampling steps for Boltz-2 diffusion. Default: %(default)s",
     )
 
     # Filtering configuration options
@@ -669,11 +698,26 @@ def configure_command(args: argparse.Namespace) -> None:
     # Prepare step configurations and collect step info
     steps_info = []
     for step in pipeline.steps:
-        config = step.get_config()
         config_filename = f"{step.name}.yaml"
         config_path = config_dir / config_filename
-        with open(config_path, "w") as f:
-            omegaconf.OmegaConf.save(config, f)
+
+        if step.name == "boltz2_refolding":
+            # Write a simple YAML with bridge parameters (not a Hydra config)
+            bridge_config = {k: v for arg in step.args for k, v in [arg.split("=", 1)]}
+            # Convert numeric strings
+            for k in bridge_config:
+                try:
+                    bridge_config[k] = float(bridge_config[k])
+                    if bridge_config[k] == int(bridge_config[k]):
+                        bridge_config[k] = int(bridge_config[k])
+                except ValueError:
+                    pass
+            with open(config_path, "w") as f:
+                yaml.dump(bridge_config, f, default_flow_style=False, sort_keys=False)
+        else:
+            config = step.get_config()
+            with open(config_path, "w") as f:
+                omegaconf.OmegaConf.save(config, f)
 
         # Add step info for steps.yaml (use relative path from output directory)
         steps_info.append(
@@ -727,6 +771,39 @@ def check_command(args: argparse.Namespace) -> None:
             output_dir.mkdir(parents=True)
 
     check_design_specs(args, moldir, mols)
+
+
+def _run_boltz2_refolding_step(config_path: Path) -> None:
+    """Execute the Boltz-2 bridge refolding step from its config YAML."""
+    from boltzgen.task.predict.boltz2_bridge import run_boltz2_refolding
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    design_dir = Path(cfg["design_dir"])
+
+    # Find the target CIF: use the first *_native.cif in the design directory
+    native_cifs = sorted(design_dir.glob("*_native.cif"))
+    if not native_cifs:
+        raise FileNotFoundError(
+            f"No *_native.cif files found in {design_dir}. "
+            "Cannot determine target structure for Boltz-2 refolding."
+        )
+    target_cif = native_cifs[0]
+    print(f"Using target structure: {target_cif}")
+
+    moldir = cfg.get("moldir")
+    if moldir is not None:
+        moldir = Path(moldir)
+
+    run_boltz2_refolding(
+        design_dir=design_dir,
+        target_cif=target_cif,
+        template_threshold=float(cfg.get("template_threshold", 2.0)),
+        diffusion_samples=int(cfg.get("diffusion_samples", 5)),
+        sampling_steps=int(cfg.get("sampling_steps", 200)),
+        moldir=moldir,
+    )
 
 
 def execute_command(args: argparse.Namespace) -> None:
@@ -807,7 +884,10 @@ def execute_command(args: argparse.Namespace) -> None:
         os.environ["BOLTZGEN_PIPELINE_STEP"] = step_name
 
         start = time.time()
-        if args.subprocess:
+        if step_name == "boltz2_refolding":
+            # Run Boltz-2 bridge directly (not via Task/Hydra)
+            _run_boltz2_refolding_step(config_path)
+        elif args.subprocess:
             command = [
                 sys.executable,
                 str(main_script),
@@ -843,6 +923,9 @@ class PipelineStep:
             raise ValueError(
                 f"Invalid step name: {self.name}. Available steps: {step_names}"
             )
+        # boltz2_refolding uses a sentinel config_path; skip file check
+        if self.name == "boltz2_refolding":
+            return
         if not os.path.exists(self.config_path):
             raise FileNotFoundError(f"Config file not found: {self.config_path}")
 
@@ -1103,26 +1186,42 @@ class BinderDesignPipeline:
                     )
                 )
 
-        # Folding
+        # Folding (or Boltz-2 refolding)
         input_dir = output_dir
-        self.steps.append(
-            PipelineStep(
-                name="folding",
-                config_path=args.config_dir / "fold.yaml",
-                args=[
-                    f"output={output_dir}",
-                    f"data.design_dir={input_dir}",
-                    f"trainer.devices={devices}",
-                    f"data.cfg.num_workers={args.num_workers}",
-                    f"data.skip_existing={args.reuse}",
-                    f"data.skip_existing_kind=folded",
-                    f"override.use_kernels={use_kernels}",
-                    f"checkpoint={get_artifact_path(args, args.folding_checkpoint)}",
-                    f"data.cfg.moldir={moldir}",
-                ]
-                + config_args_by_step["folding"],
+        if getattr(args, "use_boltz2_refolding", False):
+            # Use Boltz-2 CLI for template-enforced refolding
+            self.steps.append(
+                PipelineStep(
+                    name="boltz2_refolding",
+                    config_path="__boltz2_bridge__",  # sentinel: not a real config file
+                    args=[
+                        f"design_dir={input_dir}",
+                        f"template_threshold={args.template_threshold}",
+                        f"diffusion_samples={args.boltz2_diffusion_samples}",
+                        f"sampling_steps={args.boltz2_sampling_steps}",
+                        f"moldir={moldir}",
+                    ],
+                )
             )
-        )
+        else:
+            self.steps.append(
+                PipelineStep(
+                    name="folding",
+                    config_path=args.config_dir / "fold.yaml",
+                    args=[
+                        f"output={output_dir}",
+                        f"data.design_dir={input_dir}",
+                        f"trainer.devices={devices}",
+                        f"data.cfg.num_workers={args.num_workers}",
+                        f"data.skip_existing={args.reuse}",
+                        f"data.skip_existing_kind=folded",
+                        f"override.use_kernels={use_kernels}",
+                        f"checkpoint={get_artifact_path(args, args.folding_checkpoint)}",
+                        f"data.cfg.moldir={moldir}",
+                    ]
+                    + config_args_by_step["folding"],
+                )
+            )
 
         # Design folding
         input_dir = output_dir
