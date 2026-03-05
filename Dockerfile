@@ -1,13 +1,12 @@
 # syntax=docker/dockerfile:1
 
-FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     CUDA_HOME=/usr/local/cuda \
-    PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121 \
     HF_HOME=/cache
     
 RUN apt-get update && \
