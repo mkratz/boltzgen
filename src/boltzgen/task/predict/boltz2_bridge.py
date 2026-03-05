@@ -33,6 +33,74 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _renumber_cif_residues(cif_path: Path, output_path: Path) -> Path:
+    """Write a copy of an mmCIF with residues renumbered sequentially from 1.
+
+    Boltz-2's template parser assumes 1-based sequential residue numbering.
+    BoltzGen's native CIF files may have non-sequential numbering (e.g. when
+    leading unresolved residues were stripped), which causes an IndexError
+    in Boltz-2's ``parse_polymer``.
+    """
+    doc = gemmi.cif.read(str(cif_path))
+    block = doc[0]
+
+    # Build per-chain renumbering: old auth_seq_id -> new sequential id
+    atom_site = block.find("_atom_site.", ["auth_asym_id", "auth_seq_id"])
+    if not atom_site:
+        doc.write_file(str(output_path))
+        return output_path
+
+    chain_seq_ids: Dict[str, list] = {}
+    for row in atom_site:
+        cid = row[0]
+        sid = row[1]
+        if cid not in chain_seq_ids:
+            chain_seq_ids[cid] = []
+        if not chain_seq_ids[cid] or chain_seq_ids[cid][-1] != sid:
+            chain_seq_ids[cid].append(sid)
+
+    # Map old -> new for each chain
+    renumber_map: Dict[str, Dict[str, str]] = {}
+    for cid, sids in chain_seq_ids.items():
+        seen: Dict[str, str] = {}
+        counter = 0
+        for sid in sids:
+            if sid not in seen:
+                counter += 1
+                seen[sid] = str(counter)
+        renumber_map[cid] = seen
+
+    # Apply renumbering to auth_seq_id and label_seq_id in _atom_site
+    for tag in ["auth_seq_id", "label_seq_id"]:
+        col_chain = block.find("_atom_site.", ["auth_asym_id", tag])
+        if col_chain:
+            for row in col_chain:
+                cid = row[0]
+                old_id = row[1]
+                if cid in renumber_map and old_id in renumber_map[cid]:
+                    row[1] = renumber_map[cid][old_id]
+
+    # Also renumber _entity_poly_seq.num (gemmi needs 1-based sequential here)
+    # Build entity_id -> chain mapping from _struct_asym
+    entity_to_chain: Dict[str, str] = {}
+    struct_asym = block.find("_struct_asym.", ["id", "entity_id"])
+    if struct_asym:
+        for row in struct_asym:
+            entity_to_chain[row[1]] = row[0]
+
+    eps = block.find("_entity_poly_seq.", ["entity_id", "num"])
+    if eps:
+        for row in eps:
+            eid = row[0]
+            old_num = row[1]
+            cid = entity_to_chain.get(eid)
+            if cid and cid in renumber_map and old_num in renumber_map[cid]:
+                row[1] = renumber_map[cid][old_num]
+
+    doc.write_file(str(output_path))
+    return output_path
+
+
 def _extract_sequences_from_cif(
     cif_path: Path,
 ) -> Dict[str, str]:
@@ -124,16 +192,18 @@ def _get_boltzgen_atom_keys_and_feats(
     tokenizer = Tokenizer()
     tokenized = tokenizer.tokenize(structure)
 
-    # Build atom key list from the structure's atom ordering
+    # Build atom key list from the structure's atom ordering.
+    # Use 1-based sequential residue numbering per chain to match
+    # the renumbered Boltz-2 output (see _renumber_cif_residues).
     atom_keys: List[Tuple[str, int, str]] = []
     for chain in structure.chains:
         chain_name = chain["name"]
         res_start = chain["res_idx"]
         res_end = res_start + chain["res_num"]
-        for res in structure.residues[res_start:res_end]:
+        for seq_idx, res in enumerate(structure.residues[res_start:res_end]):
             atom_start = res["atom_idx"]
             atom_end = atom_start + res["atom_num"]
-            res_num = res["res_idx"] + 1  # 1-based
+            res_num = seq_idx + 1  # 1-based sequential, matches Boltz-2 output
             for atom in structure.atoms[atom_start:atom_end]:
                 atom_keys.append((chain_name, res_num, atom["name"]))
 
@@ -162,7 +232,7 @@ def _get_boltzgen_atom_keys_and_feats(
         max_seqs=1,
         backbone_only=False,
         atom14=True,
-        design=False,
+        design=True,
         override_method="X-RAY DIFFRACTION",
     )
 
@@ -182,19 +252,19 @@ def _get_boltzgen_atom_keys_and_feats(
     feat_arrays["mol_type"] = features["mol_type"].numpy()
     feat_arrays["backbone_mask"] = features["backbone_mask"].numpy()
 
-    # Build the atom key list from the featurized structure
-    # The featurizer may reorder atoms relative to the raw CIF parsing,
-    # so we rebuild the keys from the structure object that was tokenized/featurized
+    # Build the atom key list from the featurized structure.
+    # Use 1-based sequential numbering PER CHAIN to match the renumbered
+    # Boltz-2 output (see _renumber_cif_residues).
     featurized_atom_keys: List[Tuple[str, int, str]] = []
     for chain in structure.chains:
         chain_name = chain["name"]
         res_start = chain["res_idx"]
         res_end = res_start + chain["res_num"]
-        for res_idx in range(res_start, res_end):
+        for seq_idx, res_idx in enumerate(range(res_start, res_end)):
             res = structure.residues[res_idx]
             atom_start = res["atom_idx"]
             atom_end = atom_start + res["atom_num"]
-            res_seq = res_idx + 1  # 1-based sequence number
+            res_seq = seq_idx + 1  # 1-based sequential per chain
             for atom in structure.atoms[atom_start:atom_end]:
                 featurized_atom_keys.append((chain_name, res_seq, atom["name"]))
 
@@ -262,10 +332,15 @@ def generate_boltz2_yaml(
             )
         sequences.append({"protein": {"id": cid, "sequence": seq}})
 
+    # Renumber template CIF residues sequentially (Boltz-2 requires 1-based)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    renumbered_cif = output_path.parent / f"{output_path.stem}_template.cif"
+    _renumber_cif_residues(target_cif, renumbered_cif)
+
     # Template block – constrain target chains to their known structure
     templates = [
         {
-            "cif": str(target_cif.resolve()),
+            "cif": str(renumbered_cif.resolve()),
             "chain_id": target_chain_ids,
             "template_id": target_chain_ids,
             "force": True,
@@ -275,7 +350,6 @@ def generate_boltz2_yaml(
 
     boltz2_input = {"sequences": sequences, "templates": templates}
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         yaml.dump(boltz2_input, f, default_flow_style=False, sort_keys=False)
 
@@ -345,7 +419,11 @@ def convert_boltz2_to_boltzgen(
         boltzgen_atom_keys = _get_atom_keys_from_cif(design_cif_path)
         feat_arrays = None
 
-    n_atoms = len(boltzgen_atom_keys)
+    # Use featurizer atom count if available (may include padding atoms for atom14)
+    if feat_arrays is not None and "input_coords" in feat_arrays:
+        n_atoms = feat_arrays["input_coords"].shape[-2]
+    else:
+        n_atoms = len(boltzgen_atom_keys)
 
     # --- Collect Boltz-2 outputs across all samples ---
     all_coords = []
@@ -427,6 +505,19 @@ def convert_boltz2_to_boltzgen(
 
     # --- Build output NPZ ---
     out_dict = {}
+
+    # Fill NaN coords with input_coords so analysis RMSD doesn't hit non-finite values.
+    # Unmapped atoms (side chains with different naming) get their reference positions.
+    if feat_arrays is not None and "input_coords" in feat_arrays:
+        ref = feat_arrays["input_coords"]
+        # ref may be (1, N, 3) or (N, 3); broadcast to match coords_stack
+        if ref.ndim == 3:
+            ref_broadcast = np.broadcast_to(ref, coords_stack.shape)
+        else:
+            ref_broadcast = np.broadcast_to(ref[np.newaxis], coords_stack.shape)
+        nan_mask = np.isnan(coords_stack)
+        coords_stack = np.where(nan_mask, ref_broadcast, coords_stack)
+
     out_dict["coords"] = coords_stack
 
     # Structural metadata from BoltzGen featurization
@@ -506,7 +597,10 @@ def convert_boltz2_to_boltzgen(
 def _get_atom_keys_from_cif(
     cif_path: Path,
 ) -> List[Tuple[str, int, str]]:
-    """Fallback: get atom keys from CIF using Gemmi (raw ordering)."""
+    """Fallback: get atom keys from CIF using Gemmi (raw ordering).
+
+    Uses 1-based sequential numbering per chain to match renumbered Boltz-2 output.
+    """
     doc = gemmi.cif.read(str(cif_path))
     block = doc[0]
     st = gemmi.make_structure_from_block(block)
@@ -514,9 +608,10 @@ def _get_atom_keys_from_cif(
     keys: List[Tuple[str, int, str]] = []
     for model in st:
         for chain in model:
-            for residue in chain:
+            for seq_idx, residue in enumerate(chain):
+                res_num = seq_idx + 1  # 1-based sequential
                 for atom in residue:
-                    keys.append((chain.name, residue.seqid.num, atom.name))
+                    keys.append((chain.name, res_num, atom.name))
     return keys
 
 
@@ -713,16 +808,32 @@ def run_boltz2_refolding(
                     logger.error(
                         "Boltz-2 failed for %s:\nstdout: %s\nstderr: %s",
                         sample_id,
-                        result.stdout[-500:] if result.stdout else "",
-                        result.stderr[-500:] if result.stderr else "",
+                        result.stdout[-2000:] if result.stdout else "",
+                        result.stderr[-2000:] if result.stderr else "",
                     )
-                    print(f"  [{sample_id}] FAILED")  # noqa: T201
+                    print(f"  [{sample_id}] FAILED (exit code {result.returncode})")  # noqa: T201
+                    if result.stderr:
+                        print(f"  stderr: {result.stderr[-500:]}")  # noqa: T201
                     failed += 1
                     continue
 
+                # Debug: show boltz2 output and any errors
+                if result.stderr:
+                    for line in result.stderr.splitlines():
+                        if "Error" in line or "Failed" in line or "Traceback" in line or "File " in line:
+                            print(f"  [{sample_id}] boltz2: {line.strip()}")  # noqa: T201
+
                 # Convert outputs
+                # Boltz-2 nests results under boltz_results_<stem>/
+                boltz2_out = tmpdir / "output" / f"boltz_results_{sample_id}"
+                if not boltz2_out.exists():
+                    # List what's actually in the output dir for debugging
+                    out_dir = tmpdir / "output"
+                    contents = list(out_dir.iterdir()) if out_dir.exists() else []
+                    print(f"  [{sample_id}] Expected {boltz2_out} but not found")  # noqa: T201
+                    print(f"  [{sample_id}] Output dir contents: {[p.name for p in contents]}")  # noqa: T201
                 success = convert_boltz2_to_boltzgen(
-                    boltz2_output_dir=tmpdir / "output",
+                    boltz2_output_dir=boltz2_out,
                     design_metadata_npz=metadata_npz,
                     design_cif_path=design_cif,
                     output_npz_path=output_npz,

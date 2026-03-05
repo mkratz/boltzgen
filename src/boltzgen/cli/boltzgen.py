@@ -1189,6 +1189,8 @@ class BinderDesignPipeline:
         # Folding (or Boltz-2 refolding)
         input_dir = output_dir
         if getattr(args, "use_boltz2_refolding", False):
+            # Boltz-2 refolding needs the native CIF as a template
+            self.steps[-1].args.append("writer.write_native=true")
             # Use Boltz-2 CLI for template-enforced refolding
             self.steps.append(
                 PipelineStep(
