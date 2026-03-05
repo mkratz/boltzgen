@@ -123,6 +123,9 @@ def _extract_sequences_from_cif(
                 if not info.is_amino_acid():
                     continue
                 letter = info.one_letter_code if info.one_letter_code != "?" else "X"
+                # D-amino acids map to lowercase L-counterparts (e.g. DPR -> 'p');
+                # uppercase to get the standard residue for Boltz-2.
+                letter = letter.upper()
                 seq_letters.append(letter)
             if seq_letters:
                 sequences[chain.name] = "".join(seq_letters)
