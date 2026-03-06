@@ -160,7 +160,7 @@ def _get_boltzgen_atom_keys_and_feats(
     design_cif_path: Path,
     metadata_npz_path: Path,
     moldir: Path,
-) -> Tuple[List[Tuple[str, int, str]], dict]:
+) -> Tuple[List[Tuple[str, int, str]], dict, "Structure"]:
     """Re-featurize the design CIF through BoltzGen's pipeline to get the
     correct atom ordering and structural metadata fields.
 
@@ -172,6 +172,8 @@ def _get_boltzgen_atom_keys_and_feats(
         Contains ``input_coords``, ``res_type``, ``token_index``,
         ``atom_resolved_mask``, ``atom_to_token``, ``mol_type``,
         ``backbone_mask`` as numpy arrays.
+    structure : Structure
+        The parsed BoltzGen Structure object (for CIF generation).
     """
     from boltzgen.data.data import Structure
     from boltzgen.data.mol import load_canonicals
@@ -271,7 +273,7 @@ def _get_boltzgen_atom_keys_and_feats(
             for atom in structure.atoms[atom_start:atom_end]:
                 featurized_atom_keys.append((chain_name, res_seq, atom["name"]))
 
-    return featurized_atom_keys, feat_arrays
+    return featurized_atom_keys, feat_arrays, structure
 
 
 # ---------------------------------------------------------------------------
@@ -413,9 +415,12 @@ def convert_boltz2_to_boltzgen(
         return False
 
     # --- Get BoltzGen's atom ordering by re-featurizing the design CIF ---
+    boltzgen_structure = None
     if moldir is not None:
-        boltzgen_atom_keys, feat_arrays = _get_boltzgen_atom_keys_and_feats(
-            design_cif_path, design_metadata_npz, moldir
+        boltzgen_atom_keys, feat_arrays, boltzgen_structure = (
+            _get_boltzgen_atom_keys_and_feats(
+                design_cif_path, design_metadata_npz, moldir
+            )
         )
     else:
         # Fallback: use Gemmi raw ordering (less reliable but avoids heavy deps)
@@ -583,9 +588,22 @@ def convert_boltz2_to_boltzgen(
     )
     best_idx = int(np.nanargmax(score))
 
-    best_mmcif = pred_dir / f"{yaml_stem}_model_{best_idx}.cif"
+    # Generate the CIF from BoltzGen's structure with Boltz-2 coordinates
+    # so that it only contains resolved atoms (matching analysis masks).
+    # The raw Boltz-2 CIF predicts ALL atoms including those unresolved in
+    # the original structure, which causes mask/atom dimension mismatches.
     output_cif_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(best_mmcif, output_cif_path)
+    if boltzgen_structure is not None:
+        from boltzgen.data.write.mmcif import to_mmcif
+
+        best_coords = all_coords[best_idx]
+        n_struct_atoms = len(boltzgen_structure.atoms)
+        boltzgen_structure.coords["coords"][:] = best_coords[:n_struct_atoms]
+        cif_text = to_mmcif(boltzgen_structure)
+        output_cif_path.write_text(cif_text)
+    else:
+        best_mmcif = pred_dir / f"{yaml_stem}_model_{best_idx}.cif"
+        shutil.copy2(best_mmcif, output_cif_path)
 
     logger.info(
         "Converted %s: %d samples, best=%d (score=%.3f)",
